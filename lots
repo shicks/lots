@@ -1,0 +1,130 @@
+#!/usr/bin/perl
+
+# Plan: preprocess a ledger file
+# Look for specific comments LOTS: and act on them.
+#
+# Specific comments:
+#   LOTS:fees=Expenses:BTC:Transaction  - sets the account to look for fees
+#   LOTS:assets=Assets                  - sets the account to look for lots
+#   LOTS:realize=max                    - realizes maximum [minimum] gains
+#
+# The latter will call out to ledger using information on the given line to
+# figure out what to do.  It will ask for all the lots in the [assets] account
+# and will take the amount being commented plus the amount in the fees account
+# and output line items zeroing out the fees and the lots.
+
+use strict;
+use warnings;
+use IPC::Run qw/run/;
+
+my %MONTHS = (
+  Jan=>'01', Feb=>'02', Mar=>'03', Apr=>'04', May=>'05', Jun=>'06',
+  Jul=>'07', Aug=>'08', Sep=>'09', Oct=>'10', Nov=>'11', Dec=>'12',
+);
+
+# Lines built up so far
+my @command = qw/ledger -f - bal/;
+my $ledger = ();
+my @current = ();
+
+my $fees = '';
+my $assets = '';
+my $date = '';
+
+sub pushCurrent {
+  local($_) = shift;
+  $ledger .= join('', @current);
+  @current = ();
+  # Also check the date.
+  if ($date and /\S/) {
+    m|\d{4}/\d{2}/\d{2}| or die "Bad date: [$_]";
+    die "Entries out of order" if $& lt $date;
+  }
+  $date = $&;
+}
+
+sub num {
+  my $num = shift;
+  $num =~ s/^\$//;
+  $num =~ s/,//g;
+  return +$num;
+}
+
+while (<>) {
+  pushCurrent $_ if /^[^;\s]/;
+  $fees = $1 if s/LOTS:fees=(\S+(?:\s\S+)*)//;
+  $assets = $1 if s/LOTS:assets=(\S+(?:\s\S+)*)//;
+  if (s/LOTS:realize=(min|max)// and not /^\s*;/) {
+    
+    my $strat = $1;
+    # Parse the current line.
+    /
+      (?<spaces>\s+)
+      (?<account>
+        \S+
+        (?:\s\S+)*
+      )
+      \s{2,}
+      -
+      (?<amount>
+        [0-9,.]+
+      )
+      \s+
+      (?<currency>
+        \S+
+      )
+    /x or die "Bad transaction: $_";
+    my ($account, $amount, $currency) = (num($+{account}), $+{amount}, $+{currency});
+    my $spaces = $+{spaces};
+
+    # Call out to ledger.
+    my $feesTotal = 0;
+    my @cmd;
+    my $out;
+    if ($fees) {
+      @cmd = qw/ledger -f - bal/;
+      $out = '';
+      run [@cmd, $fees], '<', \$ledger, '>', \$out or die "ledger failed: $?";
+      if ($out) {
+        $out =~ /^\s*([0-9,.]+)\s+$currency/ or die "Could not find $currency fees:  $out";
+        $feesTotal = num($1);
+        $amount += $feesTotal;
+      }
+      push @current, "$spaces$fees  -$feesTotal $currency @ \$0\n";
+      #push @current, "$spaces$account  $feesTotal $currency\n";
+    }
+    my $acct = $assets || $account;
+    @cmd = qw/ledger -f - bal --lots/;
+    $out = '';
+    run [@cmd, $acct], '<', \$ledger, '>', \$out or die "ledger failed: $?";
+    $out =~ s/.*--------------------// or die "unexpected output: $_";
+    my @lots = ();
+    my @lines = split /\n/, $out;
+    @lines = reverse @lines if $strat eq 'min'; # lines should be increasing in price
+    for (@lines) {
+      last if $amount <= 0;
+      next unless /$currency/ and /\{/;
+      /
+        ^
+        (?<amount> [0-9,.]+ )
+        \s+ $currency \s+ \{
+        (?<price> [^}]+ )
+        \} \s+ \[
+        (?<yr> \d\d ) - (?<mon> \w{3} ) - (?<day> \d\d )
+        \]          
+      /x or die "Could not parse lot: $_\n$out";
+      my $lotAmount = num($+{amount});
+      my $date = "20$+{yr}/$MONTHS{$+{mon}}/$+{day}";
+      $lotAmount = $amount if $lotAmount > $amount;
+      push @current, "$spaces$account  -$lotAmount $currency\ {$+{price}}\ [$date] @ $+{price}\n";
+      $amount -= $lotAmount;
+    }
+    next;
+  }
+  die "Unhandled LOTS directive: $_" if /LOTS:/;
+  next if /^\s*;\s*$/;
+  push @current, $_;
+}
+pushCurrent '';
+
+print $ledger;
